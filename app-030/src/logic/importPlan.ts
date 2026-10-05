@@ -2,9 +2,11 @@
  * 批量导入：表头模糊匹配 + 两步式 dry_run 预览（新增 / 更新 / 无效 / 错误行）。
  * 严格校验：数值范围、性别值（男/女/M/F）、重复行（同名 + 同班级 + 同身高体重，只提示不删除）。
  */
-import type { Gender, Person, Project, SizeRule } from './types'
+import type { Gender, ImportRef, Person, Project, SizeRule } from './types'
 import { analyzeDraft, makePersonId, duplicateKeyOf, type PersonDraft } from './analyze'
 import { parseLengthCm, parseWeightKg } from './precision'
+import { makeImportId, snapshotImportedState } from './undoImport'
+import { runMerge } from './merge'
 
 export type ImportFieldKey =
   | 'name'
@@ -320,6 +322,11 @@ export function createPersonFromDraft(draft: PersonDraft, rule: SizeRule, duplic
 
 export type ApplyResult = { added: number; updated: number; invalid: number; skipped: number }
 
+/** 深拷贝人员（含嵌套 anomaly / result），供台账保存导入前快照 */
+function clonePerson(person: Person): Person {
+  return JSON.parse(JSON.stringify(person)) as Person
+}
+
 /** 正式导入：写入项目（重复行只提示、不自动删除；同一文件指纹幂等由调用方先校验） */
 export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): ApplyResult {
   const existingByKey = new Map<string, Person>()
@@ -328,6 +335,10 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
     if (!existingByKey.has(key)) existingByKey.set(key, person)
   }
   const result: ApplyResult = { added: 0, updated: 0, invalid: 0, skipped: 0 }
+  // 台账快照：登记本次导入新增 / 更新过的每个人，撤销时据此删除或恢复。
+  // after 快照在归并后统一生成（见函数末尾），口径与撤销时重跑归并一致。
+  const refMeta: Omit<ImportRef, 'after'>[] = []
+  const now = Date.now()
   for (const row of dryRun.rows) {
     if (row.kind === 'error' || !row.draft) {
       result.skipped += 1
@@ -339,6 +350,7 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
     if (row.kind === 'update') {
       const existing = existingByKey.get(key)
       if (existing) {
+        const before = clonePerson(existing)
         existing.heightCm = created.heightCm
         existing.weightKg = created.weightKg
         existing.chestCm = created.chestCm
@@ -353,25 +365,62 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
         existing.sourceRow = created.sourceRow
         existing.result = null
         result.updated += 1
+        refMeta.push({
+          personId: existing.id,
+          kind: 'updated',
+          lineNo: row.lineNo,
+          name: existing.name,
+          orgUnit: existing.orgUnit,
+          gender: existing.gender,
+          before
+        })
         continue
       }
     }
+    created.createdAt = now
     project.persons.push(created)
     existingByKey.set(key, created)
     if (row.kind === 'invalid') result.invalid += 1
     else result.added += 1
+    refMeta.push({
+      personId: created.id,
+      kind: 'added',
+      lineNo: row.lineNo,
+      name: created.name,
+      orgUnit: created.orgUnit,
+      gender: created.gender,
+      before: null
+    })
+  }
+  // 立即按项目锁定版本重跑归并：台账 after 快照保存「导入 + 归并后」状态，
+  // 与撤销时重跑归并后的口径一致，自动归并结果不会被误判成后来的人工改动。
+  runMerge(project, rule)
+  const byId = new Map(project.persons.map((person) => [person.id, person]))
+  const refs: ImportRef[] = []
+  for (const meta of refMeta) {
+    const person = byId.get(meta.personId)
+    if (!person) continue
+    refs.push({ ...meta, after: snapshotImportedState(person) })
   }
   project.imports.push({
+    id: makeImportId(),
     fingerprint: dryRun.fingerprint,
     fileName: dryRun.fileName,
-    at: Date.now(),
+    at: now,
     rows: dryRun.counts.total,
     added: result.added,
     updated: result.updated,
     invalid: result.invalid,
-    skipped: result.skipped
+    skipped: result.skipped,
+    status: 'active',
+    refs
   })
   return result
+}
+
+/** 指纹幂等：只认未撤销的台账，已撤销的文件重传不再被拦 */
+export function isFingerprintImported(project: Project, fingerprint: string): boolean {
+  return project.imports.some((record) => record.status === 'active' && record.fingerprint === fingerprint)
 }
 
 export const IMPORT_TEMPLATE_HEADER = [

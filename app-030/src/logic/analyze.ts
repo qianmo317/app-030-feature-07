@@ -164,7 +164,11 @@ export function findDuplicateIds(persons: Person[], draft: PersonDraft, excludeI
     .map((person) => person.id)
 }
 
+/** 进程内单调递增序号：即使同一毫秒内连续新建（批量导入、测试），id 也绝不撞车 */
+let personSeq = 0
+
 export function makePersonId(): string {
   const rand = Math.random().toString(36).slice(2, 8)
-  return `p_${Date.now().toString(36)}_${rand}`
+  personSeq = (personSeq + 1) % 0x100000
+  return `p_${Date.now().toString(36)}_${personSeq.toString(36)}_${rand}`
 }

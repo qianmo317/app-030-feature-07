@@ -36,8 +36,19 @@ export const ruleVersions = computed(() => store.rules.map((rule) => rule.versio
 
 const persistTimers = new Map<string, number>()
 
-function sortProjects(): void {
+export function sortProjects(): void {
   store.projects.sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+/** 老版本项目数据补齐：导入台账在旧版只记条数，没有 id / status / refs（不可精确撤销） */
+function normalizeProject(project: Project): Project {
+  project.imports = (project.imports ?? []).map((record, index) => ({
+    ...record,
+    id: record.id ?? `imp_legacy_${project.id}_${index}`,
+    status: record.status ?? 'active',
+    refs: record.refs ?? []
+  }))
+  return project
 }
 
 export async function initStore(): Promise<void> {
@@ -59,7 +70,7 @@ export async function initStore(): Promise<void> {
     if (missingBuiltin.length > 0) {
       for (const rule of missingBuiltin) await idbPut(STORE_RULES, rule)
     }
-    store.projects = projects
+    store.projects = projects.map(normalizeProject)
     sortProjects()
     const operator = meta.find((entry) => entry.key === 'operator')
     if (operator) store.operator = operator.value

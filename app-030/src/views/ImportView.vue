@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { flushProject, getProject, getRule, store } from '../logic/store'
+import { ensureMerged, flushProject, getProject, getRule, store } from '../logic/store'
 import {
   EMPTY_MAPPING,
   IMPORT_FIELDS,
@@ -11,10 +11,20 @@ import {
   buildDryRun,
   detectHeaderRow,
   guessMapping,
+  isFingerprintImported,
   mappedCount,
   type ColumnMapping,
   type DryRun
 } from '../logic/importPlan'
+import {
+  CONFLICT_LABEL,
+  buildUndoPlan,
+  defaultUndoDecisions,
+  executeUndoImport,
+  type UndoPlan,
+  type UndoDecision
+} from '../logic/undoImport'
+import type { ImportRecord } from '../logic/types'
 import { fnv1a, parseDelimitedText, readFileAsText, downloadText, toCsvText } from '../logic/csv'
 import { isXlsxFile, readXlsxRows } from '../logic/xlsx'
 
@@ -60,7 +70,7 @@ const rawPreview = computed(() => {
 
 const alreadyImported = computed(() => {
   if (!project.value || !fingerprint.value) return false
-  return project.value.imports.some((record) => record.fingerprint === fingerprint.value)
+  return isFingerprintImported(project.value, fingerprint.value)
 })
 
 const importableCount = computed(() => {
@@ -187,6 +197,7 @@ async function confirmImport(): Promise<void> {
     return
   }
   const applied = applyImport(current, preview, rule.value)
+  ensureMerged(current)
   current.perf = {
     ...(current.perf ?? {}),
     importParseMs: preview.durationMs,
@@ -195,6 +206,99 @@ async function confirmImport(): Promise<void> {
   await flushProject(current)
   resultText.value = `导入完成：新增 ${applied.added} 条、更新 ${applied.updated} 条、无效（待确认）${applied.invalid} 条、跳过错误行 ${applied.skipped} 条；文件指纹 ${preview.fingerprint} 已登记，重传同一文件不会重复写入。`
   dryRun.value = null
+}
+
+/* ------------------------------ 整批撤销 ------------------------------ */
+
+const undoTarget = ref<ImportRecord | null>(null)
+const undoPlan = ref<UndoPlan | null>(null)
+const undoDecisions = reactive<Record<string, UndoDecision>>({})
+const undoShowAll = ref(false)
+const undoBusy = ref(false)
+const undoError = ref('')
+
+const UNDO_RENDER_LIMIT = 200
+
+const undoVisibleRows = computed(() => {
+  const rows = undoPlan.value?.rows ?? []
+  return undoShowAll.value ? rows : rows.slice(0, UNDO_RENDER_LIMIT)
+})
+
+const undoHiddenCount = computed(() =>
+  undoShowAll.value ? 0 : Math.max(0, (undoPlan.value?.rows.length ?? 0) - UNDO_RENDER_LIMIT)
+)
+
+const undoConflictRows = computed(() => (undoPlan.value?.rows ?? []).filter((row) => row.conflicts.length > 0))
+
+const undoDiscardCount = computed(() =>
+  Object.values(undoDecisions).filter((decision) => decision === 'discard').length
+)
+
+const undoWillAdded = computed(
+  () =>
+    (undoPlan.value?.rows ?? []).filter(
+      (row) => row.ref.kind === 'added' && undoDecisions[row.ref.personId] === 'discard'
+    ).length
+)
+
+const undoWillUpdated = computed(
+  () =>
+    (undoPlan.value?.rows ?? []).filter(
+      (row) => row.ref.kind === 'updated' && undoDecisions[row.ref.personId] === 'discard'
+    ).length
+)
+
+function openUndo(record: ImportRecord): void {
+  const current = project.value
+  if (!current) return
+  undoError.value = ''
+  undoShowAll.value = false
+  const plan = buildUndoPlan(current, record)
+  undoTarget.value = record
+  undoPlan.value = plan
+  const defaults = defaultUndoDecisions(plan)
+  for (const key of Object.keys(undoDecisions)) delete undoDecisions[key]
+  Object.assign(undoDecisions, defaults)
+}
+
+function closeUndo(): void {
+  undoTarget.value = null
+  undoPlan.value = null
+  undoError.value = ''
+}
+
+function setAllConflictDecisions(decision: UndoDecision): void {
+  for (const row of undoConflictRows.value) undoDecisions[row.ref.personId] = decision
+}
+
+async function confirmUndo(): Promise<void> {
+  const current = project.value
+  const plan = undoPlan.value
+  if (!current || !plan) return
+  undoError.value = ''
+  undoBusy.value = true
+  try {
+    const outcome = executeUndoImport(current, plan.record, { ...undoDecisions }, rule.value, store.operator)
+    current.perf = { ...(current.perf ?? {}), mergeCount: current.persons.length }
+    await flushProject(current)
+    const parts = [
+      outcome.undoneAdded > 0 ? `删除新增 ${outcome.undoneAdded} 人` : '',
+      outcome.undoneUpdated > 0 ? `恢复更新前数据 ${outcome.undoneUpdated} 人` : '',
+      outcome.skippedAdded + outcome.skippedUpdated > 0
+        ? `按要求跳过 ${outcome.skippedAdded + outcome.skippedUpdated} 条`
+        : ''
+    ].filter(Boolean)
+    resultText.value = `已整批撤销「${plan.record.fileName}」：${parts.join('、') || '全部条目不做改动'}；归并、守恒与导出已回到该次导入之前，该文件重新上传不再被拦截。`
+    closeUndo()
+  } catch (error) {
+    undoError.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    undoBusy.value = false
+  }
+}
+
+function conflictText(kinds: UndoPlan['rows'][number]['conflicts']): string {
+  return kinds.map((kind) => CONFLICT_LABEL[kind]).join('、')
 }
 
 function downloadTemplate(): void {
@@ -228,7 +332,8 @@ function formatSize(bytes: number): string {
       <div>
         <h1>{{ project.name }} · 批量导入</h1>
         <div class="sub">
-          两步式 dry_run：先预览（新增 / 更新 / 无效 / 错误行），再正式导入；同一文件指纹幂等，重传不会重复
+          两步式 dry_run：先预览（新增 / 更新 / 无效 / 错误行），再正式导入；同一文件指纹幂等，
+          已撤销的导入不再拦重传；每条台账都可整批撤销（删除新增、恢复更新前数据）
         </div>
       </div>
       <div class="spacer"></div>
@@ -410,7 +515,10 @@ function formatSize(bytes: number): string {
     </div>
 
     <div class="card">
-      <div class="card-head"><h3>导入记录（指纹幂等台账）</h3></div>
+      <div class="card-head">
+        <h3>导入记录（指纹幂等台账，可整批撤销）</h3>
+        <span class="hint">撤销会删除本次新增的人、恢复本次更新者的原始量体数据，并重算归并 / 守恒 / 导出</span>
+      </div>
       <div v-if="project.imports.length === 0" class="empty">还没有导入记录</div>
       <div v-else class="table-wrap">
         <table class="data-table">
@@ -423,11 +531,16 @@ function formatSize(bytes: number): string {
               <th class="num">更新</th>
               <th class="num">无效</th>
               <th class="num">跳过</th>
-              <th>时间</th>
+              <th>时间 / 状态</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="record in [...project.imports].reverse()" :key="record.fingerprint + record.at">
+            <tr
+              v-for="record in [...project.imports].reverse()"
+              :key="record.id ?? record.fingerprint + record.at"
+              :class="record.status === 'revoked' ? 'row-invalid' : ''"
+            >
               <td>{{ record.fileName }}</td>
               <td><code>{{ record.fingerprint }}</code></td>
               <td class="num">{{ record.rows }}</td>
@@ -435,10 +548,135 @@ function formatSize(bytes: number): string {
               <td class="num">{{ record.updated }}</td>
               <td class="num">{{ record.invalid }}</td>
               <td class="num">{{ record.skipped }}</td>
-              <td>{{ new Date(record.at).toLocaleString('zh-CN') }}</td>
+              <td>
+                <div>{{ new Date(record.at).toLocaleString('zh-CN') }}</div>
+                <span v-if="record.status === 'revoked'" class="badge badge-danger">已撤销</span>
+                <span v-else class="badge badge-ok">有效</span>
+                <div v-if="record.undo" class="hint">
+                  撤销于 {{ new Date(record.undo.at).toLocaleString('zh-CN') }}（{{ record.undo.by }}）：
+                  删除新增 {{ record.undo.undoneAdded }}、恢复更新 {{ record.undo.undoneUpdated }}、跳过
+                  {{ record.undo.skippedAdded + record.undo.skippedUpdated }}
+                </div>
+              </td>
+              <td>
+                <button
+                  v-if="record.status === 'active'"
+                  class="btn btn-sm btn-danger"
+                  type="button"
+                  @click="openUndo(record)"
+                >
+                  整批撤销
+                </button>
+                <span v-else class="hint">同文件可重新导入</span>
+              </td>
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <div v-if="undoPlan && undoTarget" class="card card-accent-warn">
+      <div class="card-head">
+        <h3>整批撤销预览 —— {{ undoTarget.fileName }}</h3>
+        <div class="spacer"></div>
+        <span class="badge badge-danger">撤销后不可自动重做，可重新导入该文件恢复</span>
+      </div>
+      <div class="card-body">
+        <p v-if="undoPlan.legacy" class="notice notice-error">
+          这是旧版台账，只记了条数、没有导入明细快照，无法精确撤销（不知道当时新增 / 更新了谁）。
+          请继续手工处理，之后新导入的记录都支持整批撤销。
+        </p>
+        <template v-else>
+          <div class="stat-row">
+            <div class="stat">
+              <div class="stat-label">将删除（新增者）</div>
+              <div class="stat-value bad">{{ undoWillAdded }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">将恢复（更新者）</div>
+              <div class="stat-value">{{ undoWillUpdated }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">无冲突直接回滚</div>
+              <div class="stat-value ok">{{ undoPlan.safeAdded + undoPlan.safeUpdated }}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">需你决定</div>
+              <div class="stat-value" :class="undoConflictRows.length ? 'warn' : 'ok'">{{ undoConflictRows.length }}</div>
+            </div>
+          </div>
+
+          <p v-if="undoConflictRows.length > 0" class="notice notice-warn" style="margin-top: 12px">
+            以下 {{ undoConflictRows.length }} 条在这次导入之后又被动过。逐条选择：
+            <b>「连同后来改动一起丢掉」</b>按本次导入前的状态回滚；<b>「跳过这一条」</b>则保留现状、只撤销台账中与其无关的部分。
+          </p>
+          <div v-if="undoConflictRows.length > 0" class="toolbar" style="margin-top: 8px">
+            <span class="hint">冲突项批量：</span>
+            <button class="btn btn-sm" type="button" @click="setAllConflictDecisions('discard')">
+              全部连同后来改动一起丢掉
+            </button>
+            <button class="btn btn-sm" type="button" @click="setAllConflictDecisions('keep')">全部跳过</button>
+          </div>
+
+          <div class="table-scroll" style="margin-top: 10px">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th class="num">来源行</th>
+                  <th>类型</th>
+                  <th>姓名</th>
+                  <th>班级/车间</th>
+                  <th>冲突</th>
+                  <th>撤销会影响什么</th>
+                  <th>你的决定</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in undoVisibleRows" :key="row.ref.personId" :class="row.conflicts.length ? 'row-invalid' : ''">
+                  <td class="num">{{ row.ref.lineNo }}</td>
+                  <td>
+                    <span class="badge" :class="row.ref.kind === 'added' ? 'badge-info' : 'badge-warn'">
+                      {{ row.ref.kind === 'added' ? '新增·撤销时删除' : '更新·撤销时恢复' }}
+                    </span>
+                  </td>
+                  <td>{{ row.ref.name }}</td>
+                  <td>{{ row.ref.orgUnit || '—' }}</td>
+                  <td>
+                    <span v-if="row.conflicts.length" class="badge badge-danger">{{ conflictText(row.conflicts) }}</span>
+                    <span v-else class="badge badge-ok">无冲突</span>
+                  </td>
+                  <td>
+                    <span v-if="row.impacts.length">{{ row.impacts.join(' ') }}</span>
+                    <span v-else class="hint">导入后未再改动，可安全回滚。</span>
+                  </td>
+                  <td>
+                    <select v-model="undoDecisions[row.ref.personId]" class="select" style="width: auto; min-width: 190px">
+                      <option value="discard">
+                        {{ row.ref.kind === 'added' ? '连同后来改动一起删除' : '连同后来改动一起丢掉（恢复旧值）' }}
+                      </option>
+                      <option value="keep">跳过这一条（保留现状）</option>
+                    </select>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="toolbar" style="margin-top: 10px">
+            <button v-if="undoHiddenCount" class="btn btn-sm" type="button" @click="undoShowAll = true">
+              显示全部 {{ undoPlan.rows.length }} 条（还有 {{ undoHiddenCount }} 条未显示）
+            </button>
+            <div class="spacer"></div>
+            <span class="hint">共将回滚 {{ undoDiscardCount }} 条</span>
+            <button class="btn btn-primary btn-danger" type="button" :disabled="undoBusy" @click="confirmUndo">
+              确认整批撤销（{{ undoDiscardCount }} 条）
+            </button>
+            <button class="btn" type="button" :disabled="undoBusy" @click="closeUndo">取消</button>
+          </div>
+          <p v-if="undoError" class="notice notice-error" style="margin-top: 10px">{{ undoError }}</p>
+        </template>
+        <div v-if="undoPlan.legacy" class="toolbar">
+          <button class="btn" type="button" @click="closeUndo">关闭</button>
+        </div>
       </div>
     </div>
   </section>
