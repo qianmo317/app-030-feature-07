@@ -17,6 +17,15 @@ import {
 } from '../logic/importPlan'
 import { fnv1a, parseDelimitedText, readFileAsText, downloadText, toCsvText } from '../logic/csv'
 import { isXlsxFile, readXlsxRows } from '../logic/xlsx'
+import {
+  activeImportWithFingerprint,
+  analyzeUndo,
+  impactLabel,
+  isUndoable,
+  performUndo,
+  type UndoPlan
+} from '../logic/undoImport'
+import type { ImportRecord } from '../logic/types'
 
 const route = useRoute()
 const project = computed(() => getProject(route.params.id as string))
@@ -60,7 +69,7 @@ const rawPreview = computed(() => {
 
 const alreadyImported = computed(() => {
   if (!project.value || !fingerprint.value) return false
-  return project.value.imports.some((record) => record.fingerprint === fingerprint.value)
+  return Boolean(activeImportWithFingerprint(project.value, fingerprint.value))
 })
 
 const importableCount = computed(() => {
@@ -195,6 +204,61 @@ async function confirmImport(): Promise<void> {
   await flushProject(current)
   resultText.value = `导入完成：新增 ${applied.added} 条、更新 ${applied.updated} 条、无效（待确认）${applied.invalid} 条、跳过错误行 ${applied.skipped} 条；文件指纹 ${preview.fingerprint} 已登记，重传同一文件不会重复写入。`
   dryRun.value = null
+}
+
+/* ------------------------------- 整批撤销 ------------------------------- */
+
+const undoPlan = ref<UndoPlan | null>(null)
+const undoError = ref('')
+
+function openUndo(record: ImportRecord): void {
+  const current = project.value
+  if (!current || !isUndoable(record)) return
+  undoError.value = ''
+  undoPlan.value = analyzeUndo(current, record)
+}
+
+function closeUndo(): void {
+  undoPlan.value = null
+  undoError.value = ''
+}
+
+const undoConflictItems = computed(() => {
+  const plan = undoPlan.value
+  if (!plan) return []
+  return [...plan.addedItems, ...plan.updatedItems].filter((item) => item.impacts.length > 0)
+})
+
+async function confirmUndo(force: boolean): Promise<void> {
+  const current = project.value
+  const plan = undoPlan.value
+  if (!current || !plan) return
+  if (plan.hasConflicts && !force) {
+    undoError.value = '存在导入后的牵连改动：请选择「连同后来改动一起强制撤销」，或关闭本面板跳过这一条（什么都不改）。'
+    return
+  }
+  if (plan.hasConflicts && force) {
+    const impacted = undoConflictItems.value.length
+    const ok = window.confirm(
+      `强制撤销将丢弃 ${impacted} 条记录在该次导入之后发生的改动（手工修改 / 覆写 / 状态变更 / 核对挑选），删除的新增人员不会再恢复。确认继续？`
+    )
+    if (!ok) return
+  }
+  const outcome = performUndo(current, plan.record, rule.value, store.operator)
+  await flushProject(current)
+  resultText.value =
+    `已整批撤销「${plan.record.fileName}」：删除新增 ${outcome.removedAdded} 条` +
+    (outcome.goneAdded ? `（另有 ${outcome.goneAdded} 条此前已被手工删除）` : '') +
+    `、恢复更新 ${outcome.restoredUpdated} 条` +
+    (outcome.removedFromCheckLists ? `、从核对清单撤出 ${outcome.removedFromCheckLists} 条挑选` : '') +
+    `；归并 / 守恒 / 导出内容已回到该次导入之前，该文件现在可以重新导入。`
+  undoPlan.value = null
+}
+
+function recordStatus(record: ImportRecord): { text: string; cls: string } {
+  if (record.legacy && !record.undo) return { text: '历史导入（无快照，不可撤销）', cls: 'badge-warn' }
+  if (record.undo?.status === 'revoked') return { text: '已撤销', cls: 'badge-danger' }
+  return { text: '可撤销', cls: 'badge-ok' }
 }
 
 function downloadTemplate(): void {
@@ -410,7 +474,11 @@ function formatSize(bytes: number): string {
     </div>
 
     <div class="card">
-      <div class="card-head"><h3>导入记录（指纹幂等台账）</h3></div>
+      <div class="card-head">
+        <h3>导入记录（指纹幂等台账，支持整批撤销）</h3>
+        <div class="spacer"></div>
+        <span class="hint">撤销会删除该次新增的人、恢复被更新者的导入前量体数据；已撤销文件可再次导入</span>
+      </div>
       <div v-if="project.imports.length === 0" class="empty">还没有导入记录</div>
       <div v-else class="table-wrap">
         <table class="data-table">
@@ -424,10 +492,12 @@ function formatSize(bytes: number): string {
               <th class="num">无效</th>
               <th class="num">跳过</th>
               <th>时间</th>
+              <th>状态</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="record in [...project.imports].reverse()" :key="record.fingerprint + record.at">
+            <tr v-for="record in [...project.imports].reverse()" :key="record.id">
               <td>{{ record.fileName }}</td>
               <td><code>{{ record.fingerprint }}</code></td>
               <td class="num">{{ record.rows }}</td>
@@ -436,9 +506,101 @@ function formatSize(bytes: number): string {
               <td class="num">{{ record.invalid }}</td>
               <td class="num">{{ record.skipped }}</td>
               <td>{{ new Date(record.at).toLocaleString('zh-CN') }}</td>
+              <td>
+                <span class="badge" :class="recordStatus(record).cls">{{ recordStatus(record).text }}</span>
+                <div v-if="record.undo?.status === 'revoked'" class="hint" style="margin-top: 2px">
+                  {{ new Date(record.undo.at!).toLocaleString('zh-CN') }} · {{ record.undo.by }}<br />
+                  删新增 {{ record.undo.removedAdded }} / 恢复 {{ record.undo.restoredUpdated }}
+                  <template v-if="record.undo.forced"> · 强制（含后来改动）</template>
+                </div>
+              </td>
+              <td>
+                <button
+                  v-if="isUndoable(record)"
+                  class="btn btn-sm btn-danger"
+                  type="button"
+                  @click="openUndo(record)"
+                >
+                  整批撤销
+                </button>
+                <span v-else class="hint">—</span>
+              </td>
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <div v-if="undoPlan" class="card card-accent-warn" style="border-width: 2px">
+      <div class="card-head">
+        <h2>撤销前影响审查 —— {{ undoPlan.record.fileName }}</h2>
+        <div class="spacer"></div>
+        <span class="badge badge-info">{{ new Date(undoPlan.record.at).toLocaleString('zh-CN') }}</span>
+      </div>
+      <div class="card-body">
+        <div class="stat-row">
+          <div class="stat"><div class="stat-label">将删除的新增</div><div class="stat-value bad">{{ undoPlan.record.addedPersonIds.length }}</div></div>
+          <div class="stat"><div class="stat-label">将恢复的更新</div><div class="stat-value">{{ undoPlan.record.updatedSnapshots.length }}</div></div>
+          <div class="stat"><div class="stat-label">有牵连改动的记录</div><div class="stat-value" :class="undoConflictItems.length ? 'bad' : 'ok'">{{ undoConflictItems.length }}</div></div>
+          <div class="stat"><div class="stat-label">已找不到的记录</div><div class="stat-value">{{ undoPlan.goneCount }}</div></div>
+        </div>
+
+        <p class="hint" style="margin-top: 10px">
+          撤销后：本次新增人员整人删除；被更新者的量体数据按导入前快照原样恢复（包括当时的状态与归并结果）；
+          人员顺序、归并结果、人数 / 套数守恒校验与所有导出内容都回到该次导入以前；
+          该文件指纹会被标记撤销，同一份文件可再次导入而不会被拦。
+        </p>
+
+        <div v-if="undoConflictItems.length" style="margin-top: 10px">
+          <p class="notice notice-warn">
+            以下 <b>{{ undoConflictItems.length }}</b> 条记录在该次导入之后又被动过，撤销会影响这些后来的工作。
+            请决定：<b>强制撤销</b>（连同后来改动一起丢掉）或 <b>跳过这一条</b>（关闭面板，数据保持不动）。
+          </p>
+          <div class="table-scroll">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>类别</th>
+                  <th>姓名</th>
+                  <th>班级/车间</th>
+                  <th class="num">行号</th>
+                  <th>撤销会影响什么</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="item in undoConflictItems" :key="(item.personId ?? 'gone') + item.impacts.map((i) => i.kind).join(',')">
+                  <tr v-for="impact in item.impacts" :key="impact.kind + impact.detail">
+                    <td>
+                      <span class="badge" :class="undoPlan.addedItems.some((a) => a.personId === item.personId) ? 'badge-info' : 'badge-warn'">
+                        {{ undoPlan.addedItems.some((a) => a.personId === item.personId) ? '该次新增' : '该次更新' }}
+                      </span>
+                    </td>
+                    <td>{{ item.name }}</td>
+                    <td>{{ item.orgUnit || '—' }}</td>
+                    <td class="num">{{ item.sourceRow ?? '—' }}</td>
+                    <td>
+                      <b>{{ impactLabel(impact.kind) }}</b>
+                      <div class="hint">{{ impact.detail }}</div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <p v-else class="notice notice-ok" style="margin-top: 10px">
+          这次导入涉及的记录之后都没有再被改动，也没有被挑进核对清单，可以直接撤销。
+        </p>
+
+        <p v-if="undoError" class="notice notice-error" style="margin-top: 10px">{{ undoError }}</p>
+
+        <div class="toolbar" style="margin-top: 12px">
+          <button class="btn btn-danger" type="button" @click="confirmUndo(true)">
+            {{ undoPlan.hasConflicts ? '强制撤销（连同后来改动一起丢掉）' : '确认整批撤销' }}
+          </button>
+          <button class="btn" type="button" @click="closeUndo">跳过这一条（什么都不改）</button>
+        </div>
       </div>
     </div>
   </section>

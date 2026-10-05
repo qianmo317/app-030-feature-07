@@ -15,6 +15,7 @@ import {
   idbPut,
   type MetaEntry
 } from './idb'
+import { migrateImportRecord } from './undoImport'
 
 export type AppStore = {
   ready: boolean
@@ -59,7 +60,11 @@ export async function initStore(): Promise<void> {
     if (missingBuiltin.length > 0) {
       for (const rule of missingBuiltin) await idbPut(STORE_RULES, rule)
     }
-    store.projects = projects
+    store.projects = projects.map((project) => {
+      project.checkLists ??= []
+      project.imports = (project.imports ?? []).map((record) => migrateImportRecord(record))
+      return project
+    })
     sortProjects()
     const operator = meta.find((entry) => entry.key === 'operator')
     if (operator) store.operator = operator.value
@@ -106,6 +111,7 @@ export async function createProject(input: {
     batches: input.batches.length > 0 ? input.batches : [],
     persons: [],
     imports: [],
+    checkLists: [],
     createdAt: now,
     updatedAt: now
   }

@@ -4,8 +4,9 @@ import { useRoute } from 'vue-router'
 import { ensureMerged, flushProject, getProject, getRule, persistProject, store } from '../logic/store'
 import { buildSummary, conservationText } from '../logic/merge'
 import { alignToStep, isSizeCodeValid, normalizeSizeCodeInput, specialFlagLabel } from '../logic/sizeRules'
-import { chestWaistDiffCm, cmToHalfUnits, formatCm, formatHalfUnits } from '../logic/precision'
-import type { Person, PersonStatus } from '../logic/types'
+import { analyzeDraft, type PersonDraft } from '../logic/analyze'
+import { chestWaistDiffCm, cmToHalfUnits, formatCm, formatHalfUnits, parseLengthCm, parseWeightKg } from '../logic/precision'
+import type { CheckList, Person, PersonStatus } from '../logic/types'
 
 const route = useRoute()
 const project = computed(() => getProject(route.params.id as string))
@@ -228,6 +229,7 @@ async function setSpecial(person: Person, code: string): Promise<void> {
   const current = project.value
   if (!current) return
   person.specialFlag = code === '' ? null : code
+  person.manualEditedAt = Date.now()
   person.needsConfirm = false
   ensureMerged(current)
   persistProject(current, true)
@@ -242,6 +244,7 @@ async function setStatus(person: Person, status: PersonStatus, reason: string): 
   if (!current) return
   person.status = status
   person.statusReason = status === 'active' ? '' : reason
+  person.statusChangedAt = Date.now()
   if (status !== 'active') person.result = null
   ensureMerged(current)
   persistProject(current, true)
@@ -255,9 +258,152 @@ async function clearDuplicateFlag(person: Person): Promise<void> {
   const current = project.value
   if (!current) return
   person.possibleDuplicateOf = null
+  person.duplicateResolvedAt = Date.now()
   if (!person.anomaly.length) person.needsConfirm = false
   persistProject(current, true)
   message.value = `已确认「${person.name}」不是重复行，标记已清除（数据未改动）`
+}
+
+/* ------------------------------ 手工改量体数据 ------------------------------ */
+
+const editTarget = ref<Person | null>(null)
+const editForm = reactive({
+  name: '',
+  gender: 'male' as Person['gender'],
+  orgUnit: '',
+  batch: '',
+  heightCm: '',
+  weightKg: '',
+  chestCm: '',
+  waistCm: '',
+  specialFlag: '',
+  note: ''
+})
+const editError = ref('')
+
+function openEdit(person: Person): void {
+  editTarget.value = person
+  editForm.name = person.name
+  editForm.gender = person.gender ?? 'male'
+  editForm.orgUnit = person.orgUnit
+  editForm.batch = person.batch
+  editForm.heightCm = person.heightCm ? formatCm(person.heightCm) : ''
+  editForm.weightKg = person.weightKg ? String(person.weightKg) : ''
+  editForm.chestCm = person.chestCm ? formatCm(person.chestCm) : ''
+  editForm.waistCm = person.waistCm ? formatCm(person.waistCm) : ''
+  editForm.specialFlag = person.specialFlag ?? ''
+  editForm.note = person.note
+  editError.value = ''
+}
+
+function closeEdit(): void {
+  editTarget.value = null
+}
+
+async function submitEdit(): Promise<void> {
+  const target = editTarget.value
+  const current = project.value
+  if (!target || !current) return
+  if (editForm.name.trim() === '') {
+    editError.value = '姓名不能为空'
+    return
+  }
+  const draft: PersonDraft = {
+    name: editForm.name,
+    gender: editForm.gender,
+    orgUnit: editForm.orgUnit,
+    batch: editForm.batch || '未分批',
+    heightCm: parseLengthCm(editForm.heightCm),
+    weightKg: parseWeightKg(editForm.weightKg),
+    chestCm: parseLengthCm(editForm.chestCm),
+    waistCm: parseLengthCm(editForm.waistCm),
+    specialFlag: editForm.specialFlag || null,
+    note: editForm.note,
+    sourceRow: target.sourceRow,
+    source: target.source
+  }
+  const outcome = analyzeDraft(draft, rule.value)
+  if (outcome.status === 'invalid') {
+    editError.value = `校验未通过：${outcome.statusReason}；如确需保留请在保存后于待确认区处理`
+  }
+  const now = Date.now()
+  const gender = draft.gender ?? 'male'
+  const identityChanged =
+    target.name !== draft.name.trim() ||
+    target.orgUnit !== draft.orgUnit.trim() ||
+    target.gender !== gender ||
+    target.batch !== draft.batch
+  if (identityChanged) target.identityEditedAt = now
+  target.name = draft.name.trim()
+  target.gender = gender
+  target.orgUnit = draft.orgUnit.trim()
+  target.batch = draft.batch
+  target.heightCm = draft.heightCm ?? 0
+  target.weightKg = draft.weightKg
+  target.chestCm = draft.chestCm ?? 0
+  target.waistCm = draft.waistCm ?? 0
+  target.specialFlag = draft.specialFlag
+  target.note = draft.note
+  target.status = outcome.status
+  target.statusReason = outcome.statusReason
+  target.anomaly = outcome.anomaly
+  target.needsConfirm = outcome.needsConfirm
+  if (outcome.status !== 'active') target.result = null
+  target.manualEditedAt = now
+  ensureMerged(current)
+  persistProject(current, true)
+  message.value = `「${target.name}」的量体数据已手工修改并重新归并；该改动会在撤销相关导入时被识别`
+  editTarget.value = null
+}
+
+/* -------------------------------- 核对清单 -------------------------------- */
+
+function listsOfPerson(person: Person): CheckList[] {
+  return (project.value?.checkLists ?? []).filter((list) => list.personIds.includes(person.id))
+}
+
+const newCheckListName = ref('')
+
+function makeCheckListId(): string {
+  return `chk_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`
+}
+
+function createCheckList(): void {
+  const current = project.value
+  if (!current) return
+  const name = newCheckListName.value.trim() || `核对单 ${current.checkLists.length + 1}`
+  current.checkLists.push({ id: makeCheckListId(), name, createdAt: Date.now(), personIds: [] })
+  newCheckListName.value = ''
+  persistProject(current, true)
+}
+
+function toggleCheck(list: CheckList, person: Person): void {
+  const current = project.value
+  if (!current) return
+  if (list.personIds.includes(person.id)) {
+    list.personIds = list.personIds.filter((id) => id !== person.id)
+    message.value = `已把「${person.name}」从核对清单「${list.name}」撤出`
+  } else {
+    list.personIds.push(person.id)
+    message.value = `已把「${person.name}」挑进核对清单「${list.name}」`
+  }
+  persistProject(current, true)
+}
+
+function onPickCheck(event: Event, person: Person): void {
+  const current = project.value
+  const select = event.target as HTMLSelectElement
+  const list = current?.checkLists.find((item) => item.id === select.value)
+  select.value = ''
+  if (list) toggleCheck(list, person)
+}
+
+function removeCheckList(list: CheckList): void {
+  const current = project.value
+  if (!current) return
+  if (!window.confirm(`确认删除核对清单「${list.name}」？只删清单本身，人员量体数据不受影响。`)) return
+  current.checkLists = current.checkLists.filter((item) => item.id !== list.id)
+  persistProject(current, true)
 }
 
 const genderText = (gender: string): string => (gender === 'male' ? '男' : '女')
@@ -641,6 +787,24 @@ const rowLabel = (sizeCode: string, isSpecial: boolean): string =>
               <td>
                 <div class="toolbar">
                   <button class="btn btn-sm" type="button" @click="openOverride(person)">覆写</button>
+                  <button class="btn btn-sm" type="button" @click="openEdit(person)">改量体</button>
+                  <select
+                    v-if="project.checkLists.length"
+                    class="select btn-sm"
+                    style="width: auto"
+                    @change="onPickCheck($event, person)"
+                  >
+                    <option value="" disabled>挑进核对…</option>
+                    <option v-for="list in project.checkLists" :key="list.id" :value="list.id">
+                      {{ list.personIds.includes(person.id) ? `撤出「${list.name}」` : `挑进「${list.name}」` }}
+                    </option>
+                  </select>
+                  <span
+                    v-for="list in listsOfPerson(person)"
+                    :key="list.id"
+                    class="badge badge-warn"
+                    :title="`在核对清单「${list.name}」中`"
+                  >核对:{{ list.name }}</span>
                   <button
                     v-if="person.result?.manualOverride"
                     class="btn btn-sm"
@@ -738,6 +902,117 @@ const rowLabel = (sizeCode: string, isSpecial: boolean): string =>
           <button class="btn btn-primary" type="button" @click="submitOverride">确认覆写</button>
           <button class="btn" type="button" @click="closeOverride">取消</button>
           <span class="hint">覆写会计入留痕，统计时同时显示「按规则归并」与「人工覆写」条数</span>
+        </div>
+      </div>
+    </div>
+    <div v-if="editTarget" class="card card-accent-warn">
+      <div class="card-head">
+        <h3>手工修改量体数据 —— {{ editTarget.name }}（行号 {{ editTarget.sourceRow ?? '—' }}）</h3>
+        <div class="spacer"></div>
+        <span class="hint">改完会重新校验与归并；该操作留痕，整批撤销导入时会列出这条后来的改动</span>
+      </div>
+      <div class="card-body">
+        <div class="form-grid">
+          <label class="field">
+            <span class="field-label">姓名 <b class="req">*</b></span>
+            <input v-model="editForm.name" class="input" type="text" />
+          </label>
+          <label class="field">
+            <span class="field-label">性别</span>
+            <select v-model="editForm.gender" class="select">
+              <option value="male">男</option>
+              <option value="female">女</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">班级 / 车间</span>
+            <input v-model="editForm.orgUnit" class="input" type="text" />
+          </label>
+          <label class="field">
+            <span class="field-label">批次</span>
+            <select v-model="editForm.batch" class="select">
+              <option value="">未分批</option>
+              <option v-for="batch in project.batches" :key="batch" :value="batch">{{ batch }}</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">身高 (cm)</span>
+            <input v-model="editForm.heightCm" class="input" type="text" inputmode="decimal" />
+          </label>
+          <label class="field">
+            <span class="field-label">体重 (kg)</span>
+            <input v-model="editForm.weightKg" class="input" type="text" inputmode="decimal" />
+          </label>
+          <label class="field">
+            <span class="field-label">胸围 (cm)</span>
+            <input v-model="editForm.chestCm" class="input" type="text" inputmode="decimal" />
+          </label>
+          <label class="field">
+            <span class="field-label">腰围 (cm)</span>
+            <input v-model="editForm.waistCm" class="input" type="text" inputmode="decimal" />
+          </label>
+          <label class="field">
+            <span class="field-label">特殊体型标记</span>
+            <select v-model="editForm.specialFlag" class="select">
+              <option value="">无（常规档）</option>
+              <option v-for="flag in rule.specialFlags" :key="flag.code" :value="flag.code">{{ flag.label }}</option>
+            </select>
+          </label>
+          <label class="field span-2">
+            <span class="field-label">备注</span>
+            <input v-model="editForm.note" class="input" type="text" />
+          </label>
+        </div>
+        <p v-if="editError" class="notice notice-warn" style="margin-top: 10px">{{ editError }}</p>
+        <div class="toolbar" style="margin-top: 10px">
+          <button class="btn btn-primary" type="button" @click="submitEdit">保存并重新归并</button>
+          <button class="btn" type="button" @click="closeEdit">取消</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h3>核对清单（{{ project.checkLists.length }} 个）</h3>
+        <div class="spacer"></div>
+        <span class="hint">挑进核对清单的人若属于某次待撤销导入，撤销前会被列出并说明影响</span>
+      </div>
+      <div class="card-body">
+        <div class="toolbar">
+          <input v-model="newCheckListName" class="input" style="width: 220px" type="text" placeholder="核对单名称，如：高一3班现场复核" @keydown.enter.prevent="createCheckList" />
+          <button class="btn btn-sm" type="button" @click="createCheckList">新建核对清单</button>
+        </div>
+        <p v-if="project.checkLists.length === 0" class="hint" style="margin-top: 8px">
+          还没有核对清单。新建后可在下方逐人明细里用「挑进核对…」把人加进去。
+        </p>
+        <div v-for="list in project.checkLists" :key="list.id" class="card" style="margin-top: 10px">
+          <div class="card-head">
+            <h4>{{ list.name }}（{{ list.personIds.length }} 人）</h4>
+            <div class="spacer"></div>
+            <button class="btn btn-sm btn-danger" type="button" @click="removeCheckList(list)">删除清单</button>
+          </div>
+          <div v-if="list.personIds.length" class="pill-list" style="padding: 8px 12px">
+            <span v-for="id in list.personIds" :key="id" class="badge badge-warn">
+              <template v-if="project.persons.find((p) => p.id === id)">
+                {{ project.persons.find((p) => p.id === id)?.name }}
+                <button
+                  class="btn btn-sm"
+                  style="padding: 0 6px; margin-left: 4px"
+                  type="button"
+                  @click="toggleCheck(list, project.persons.find((p) => p.id === id)!)"
+                >×</button>
+              </template>
+              <template v-else>
+                （已删除）
+                <button
+                  class="btn btn-sm"
+                  style="padding: 0 6px; margin-left: 4px"
+                  type="button"
+                  @click="list.personIds = list.personIds.filter((pid) => pid !== id); persistProject(project, true)"
+                >×</button>
+              </template>
+            </span>
+          </div>
         </div>
       </div>
     </div>

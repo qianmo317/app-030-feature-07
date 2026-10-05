@@ -2,9 +2,25 @@
  * 批量导入：表头模糊匹配 + 两步式 dry_run 预览（新增 / 更新 / 无效 / 错误行）。
  * 严格校验：数值范围、性别值（男/女/M/F）、重复行（同名 + 同班级 + 同身高体重，只提示不删除）。
  */
-import type { Gender, Person, Project, SizeRule } from './types'
+import type { Gender, ImportRecord, ImportUpdatedSnapshot, Person, Project, SizeRule } from './types'
 import { analyzeDraft, makePersonId, duplicateKeyOf, type PersonDraft } from './analyze'
 import { parseLengthCm, parseWeightKg } from './precision'
+
+/** 台账条目编号：时间不够区分同一秒的两次撤销+重传，再加随机串 */
+export function makeImportRecordId(): string {
+  return `imp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+}
+
+/** 撤销需要回溯的量体字段；这些字段以外的改动不算「量体数据被手改」 */
+export const MEASURE_FIELDS = [
+  'heightCm',
+  'weightKg',
+  'chestCm',
+  'waistCm',
+  'specialFlag',
+  'note'
+] as const
+export type MeasureField = (typeof MEASURE_FIELDS)[number]
 
 export type ImportFieldKey =
   | 'name'
@@ -320,7 +336,8 @@ export function createPersonFromDraft(draft: PersonDraft, rule: SizeRule, duplic
 
 export type ApplyResult = { added: number; updated: number; invalid: number; skipped: number }
 
-/** 正式导入：写入项目（重复行只提示、不自动删除；同一文件指纹幂等由调用方先校验） */
+/** 正式导入：写入项目（重复行只提示、不自动删除；同一文件指纹幂等由调用方先校验）。
+ *  台账同时记录「新增的人员 ID」与「被更新者的导入前整份快照」，供整批撤销使用。 */
 export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): ApplyResult {
   const existingByKey = new Map<string, Person>()
   for (const person of project.persons) {
@@ -328,6 +345,11 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
     if (!existingByKey.has(key)) existingByKey.set(key, person)
   }
   const result: ApplyResult = { added: 0, updated: 0, invalid: 0, skipped: 0 }
+  const addedPersonIds: string[] = []
+  const updatedSnapshots: ImportUpdatedSnapshot[] = []
+  const personOrderBefore = project.persons.map((person) => person.id)
+  const recordId = makeImportRecordId()
+
   for (const row of dryRun.rows) {
     if (row.kind === 'error' || !row.draft) {
       result.skipped += 1
@@ -339,6 +361,14 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
     if (row.kind === 'update') {
       const existing = existingByKey.get(key)
       if (existing) {
+        // 整份深拷贝：撤销时要恢复量体值、状态、异常、备注、归并结果等全部字段
+        updatedSnapshots.push({
+          personId: existing.id,
+          matchName: existing.name,
+          matchOrgUnit: existing.orgUnit,
+          matchGender: existing.gender,
+          before: JSON.parse(JSON.stringify(existing)) as Person
+        })
         existing.heightCm = created.heightCm
         existing.weightKg = created.weightKg
         existing.chestCm = created.chestCm
@@ -352,16 +382,25 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
         existing.possibleDuplicateOf = created.possibleDuplicateOf
         existing.sourceRow = created.sourceRow
         existing.result = null
+        existing.lastImportId = recordId
         result.updated += 1
         continue
       }
     }
+    created.lastImportId = recordId
     project.persons.push(created)
     existingByKey.set(key, created)
+    addedPersonIds.push(created.id)
     if (row.kind === 'invalid') result.invalid += 1
     else result.added += 1
   }
-  project.imports.push({
+
+  const pickedForCheckAtImport = project.persons
+    .filter((person) => project.checkLists.some((list) => list.personIds.includes(person.id)))
+    .map((person) => person.id)
+
+  const record: ImportRecord = {
+    id: recordId,
     fingerprint: dryRun.fingerprint,
     fileName: dryRun.fileName,
     at: Date.now(),
@@ -369,8 +408,13 @@ export function applyImport(project: Project, dryRun: DryRun, rule: SizeRule): A
     added: result.added,
     updated: result.updated,
     invalid: result.invalid,
-    skipped: result.skipped
-  })
+    skipped: result.skipped,
+    addedPersonIds,
+    updatedSnapshots,
+    personOrderBefore,
+    pickedForCheckAtImport
+  }
+  project.imports.push(record)
   return result
 }
 

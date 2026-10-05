@@ -188,6 +188,10 @@ async function removePerson(person: Person): Promise<void> {
   const current = project.value
   if (!current) return
   current.persons = current.persons.filter((item) => item.id !== person.id)
+  // 同步撤出核对清单，避免留下已删除人员的死引用（会干扰导入撤销的影响分析）
+  for (const list of current.checkLists) {
+    list.personIds = list.personIds.filter((id) => id !== person.id)
+  }
   persistProject(current, true)
   notice.value = `已删除「${person.name}」`
 }

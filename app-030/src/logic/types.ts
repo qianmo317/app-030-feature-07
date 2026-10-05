@@ -89,11 +89,77 @@ export type Person = {
   /** 导入来源行号（用于差异定位） */
   sourceRow: number | null
   source: 'manual' | 'import'
+  /** 由哪次导入新增（撤销台账用） */
+  createdByImportId?: string
+  /** 最后一次改写本记录的导入台账编号（用于识别「被后来的导入归并覆写」） */
+  lastImportId?: string
+  /** 量体字段（身高/体重/胸腰围/特殊标记/备注）最后手改时间 */
+  manualEditedAt?: number
+  /** 姓名 / 班级 / 性别 / 批次最后手改时间（身份信息改动会导致撤销时找不到原人） */
+  identityEditedAt?: number
+  /** 有效 / 无效 / 重复状态最后人工变更时间 */
+  statusChangedAt?: number
+  /** 可能重复标记最后被人工处理的时间 */
+  duplicateResolvedAt?: number
   result: PersonResult | null
   createdAt: number
 }
 
+/** 核对清单：人工挑出来准备发回学校 / 厂方核对的人 */
+export type CheckList = {
+  id: string
+  name: string
+  createdAt: number
+  personIds: string[]
+}
+
+/** 一次导入中被更新者的原始数据快照（整份拷贝），撤销时原样恢复 */
+export type ImportUpdatedSnapshot = {
+  personId: string
+  /** 姓名 + 班级/车间 + 性别，撤销时用于再次定位记录 */
+  matchName: string
+  matchOrgUnit: string
+  matchGender: Gender
+  before: Person
+}
+
+/** 撤销影响项：导入后该记录又被人工动过的痕迹 */
+export type UndoImpactKind =
+  | 'manual_edit' // 量体数据 / 备注 / 标记被手改过
+  | 'manual_override' // 号型被人工覆写过
+  | 'status_changed' // 有效 / 无效 / 重复状态被改过
+  | 'duplicate_resolved' // 可能重复标记被人工处理过
+  | 'later_import' // 又被之后的导入改过（归并覆写）
+  | 'picked_for_check' // 已被挑进核对清单
+  | 'added_gone' // 新增的人已找不到（可能已被手工删除）
+  | 'updated_gone' // 被更新的老记录已找不到（可能已被手工删除）
+  | 'updated_match_lost' // 老记录还在，但姓名/班级已改导致无法对应
+
+export type UndoImpact = {
+  kind: UndoImpactKind
+  personId: string | null
+  name: string
+  orgUnit: string
+  sourceRow: number | null
+  detail: string
+}
+
+export type ImportUndoState = {
+  status: 'active' | 'revoked'
+  at: number | null
+  by: string
+  /** 实际撤销掉的新增 / 更新条数（跳过冲突项时可能少于台账数） */
+  removedAdded: number
+  restoredUpdated: number
+  skippedAdded: number
+  skippedUpdated: number
+  forced: boolean
+  note: string
+}
+
 export type ImportRecord = {
+  /** 台账条目自身唯一编号（同一文件指纹撤销后可再次导入，不能再用指纹当 key） */
+  id: string
   fingerprint: string
   fileName: string
   at: number
@@ -102,6 +168,17 @@ export type ImportRecord = {
   updated: number
   invalid: number
   skipped: number
+  /** 本次导入新增的人员 ID（无效行也在内；撤销时整人删除） */
+  addedPersonIds: string[]
+  /** 本次导入更新过的老人员及其导入前快照（撤销时恢复） */
+  updatedSnapshots: ImportUpdatedSnapshot[]
+  /** 导入前项目的人员 ID 顺序，撤销后据此恢复排列（导出明细顺序也回到从前） */
+  personOrderBefore: string[]
+  /** 本次导入时是否登记了「已挑进核对」的人员（撤销影响分析用） */
+  pickedForCheckAtImport: string[]
+  /** 升级前遗留、没有撤销快照的台账条目：只可查看不可撤销 */
+  legacy?: boolean
+  undo?: ImportUndoState
 }
 
 export type Project = {
@@ -113,6 +190,8 @@ export type Project = {
   batches: string[]
   persons: Person[]
   imports: ImportRecord[]
+  /** 人工挑选的核对清单（撤销导入前要提示哪些人已被挑进去） */
+  checkLists: CheckList[]
   perf?: { mergeMs?: number; mergeCount?: number; importParseMs?: number; importRows?: number }
   createdAt: number
   updatedAt: number
